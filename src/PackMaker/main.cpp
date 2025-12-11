@@ -65,6 +65,10 @@ int main(int argc, char* argv[])
 			rp_str = (std::filesystem::path("d:/ymir work/") / rp_str.substr(ymir_work_prefix.size())).generic_string();
 		}
 
+		std::transform(rp_str.begin(), rp_str.end(), rp_str.begin(), [](unsigned char c) {
+			return static_cast<char>(std::tolower(c));
+		});
+
 		rp_str.copy(file_entry.file_name, sizeof(file_entry.file_name) - 1);
 	}
 
