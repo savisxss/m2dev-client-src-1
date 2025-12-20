@@ -6,12 +6,3 @@
 #define ENABLE_DRAGON_SOUL_SYSTEM
 #define ENABLE_NEW_EQUIPMENT_SYSTEM
 //#define ENABLE_DISCORD_RPC
-
-#define FIX_SEQ_254
-#define __ENABLE_STEALTH_FIX__
-#define __BL_LEVEL_FIX__
-// #define FIX_POS_SYNC
-// #define TW1X1_TEST
-
-// Python-only
-#define FIX_HORSE_SKILLS_TAB
