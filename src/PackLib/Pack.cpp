@@ -1,5 +1,17 @@
 #include "Pack.h"
+#include "EterLib/BufferPool.h"
 #include <zstd.h>
+
+static thread_local ZSTD_DCtx* g_zstdDCtx = nullptr;
+
+static ZSTD_DCtx* GetThreadLocalZSTDContext()
+{
+	if (!g_zstdDCtx)
+	{
+		g_zstdDCtx = ZSTD_createDCtx();
+	}
+	return g_zstdDCtx;
+}
 
 bool CPack::Open(const std::string& path, TPackFileMap& entries)
 {
@@ -39,26 +51,43 @@ bool CPack::Open(const std::string& path, TPackFileMap& entries)
 
 bool CPack::GetFile(const TPackFileEntry& entry, TPackFile& result)
 {
+	return GetFileWithPool(entry, result, nullptr);
+}
+
+bool CPack::GetFileWithPool(const TPackFileEntry& entry, TPackFile& result, CBufferPool* pPool)
+{
 	result.resize(entry.file_size);
 
 	size_t offset = m_header.data_begin + entry.offset;
+	ZSTD_DCtx* dctx = GetThreadLocalZSTDContext();
+
 	switch (entry.encryption)
 	{
 		case 0: {
-			size_t decompressed_size = ZSTD_decompress(result.data(), result.size(), m_file.data() + offset, entry.compressed_size);
+			size_t decompressed_size = ZSTD_decompressDCtx(dctx, result.data(), result.size(), m_file.data() + offset, entry.compressed_size);
 			if (decompressed_size != entry.file_size) {
 				return false;
 			}
 		} break;
 
 		case 1: {
-			std::vector<uint8_t> compressed_data(entry.compressed_size);
+			std::vector<uint8_t> compressed_data;
+			if (pPool) {
+				compressed_data = pPool->Acquire(entry.compressed_size);
+			}
+			compressed_data.resize(entry.compressed_size);
+
 			memcpy(compressed_data.data(), m_file.data() + offset, entry.compressed_size);
 
 			m_decryption.Resynchronize(entry.iv, sizeof(entry.iv));
 			m_decryption.ProcessData(compressed_data.data(), compressed_data.data(), entry.compressed_size);
 
-			size_t decompressed_size = ZSTD_decompress(result.data(), result.size(), compressed_data.data(), compressed_data.size());
+			size_t decompressed_size = ZSTD_decompressDCtx(dctx, result.data(), result.size(), compressed_data.data(), compressed_data.size());
+
+			if (pPool) {
+				pPool->Release(std::move(compressed_data));
+			}
+
 			if (decompressed_size != entry.file_size) {
 				return false;
 			}

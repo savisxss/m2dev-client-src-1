@@ -4,6 +4,8 @@
 
 #include "config.h"
 
+class CBufferPool;
+
 class CPack : public std::enable_shared_from_this<CPack>
 {
 public:
@@ -12,6 +14,7 @@ public:
 
 	bool Open(const std::string& path, TPackFileMap& entries);
 	bool GetFile(const TPackFileEntry& entry, TPackFile& result);
+	bool GetFileWithPool(const TPackFileEntry& entry, TPackFile& result, CBufferPool* pPool);
 
 private:
 	TPackFileHeader m_header;
