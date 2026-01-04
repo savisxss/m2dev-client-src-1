@@ -13,6 +13,7 @@ This repository contains the source code necessary to compile the game client ex
 ## 📋 Changelog
 
 ### 🐛 Bug Fixes
-* **Invisibility:** Resolved an issue where effects were not visible after becoming visible again, if they were added in AFFECT_INVISIBILITY state.
-* **Invisibility:** Resolved an issue where projectile fly effects were visible on targets within AFFECT_INVISIBILITY state.
-* **Effects on low opacity meshes**: Resolved a conflict between effects on meshes with opacity < 1 and invisibility fixes.
+* **Amun's freeze on drag window**: Fixed a bug where the client window would freeze while we are dragging it around.
+* **Debug mode:** Fly effects are now registering when using Debug mode.
+* **Fix effect rendering in low opacity models:** Effects now appear normally on semi-transparent meshes.
+* **Fly targeting fixed for buff/healing skills:** Fixed an issue where fly target effect would render in the buffer's selected target even if the target was unbuffable (if viewing from another client).
