@@ -8,6 +8,7 @@
 #include <future>
 #include <atomic>
 #include <memory>
+#include <mutex>
 
 class CGameThreadPool : public CSingleton<CGameThreadPool>
 {
@@ -35,30 +36,29 @@ public:
 	size_t GetPendingTaskCount() const;
 
 	// Check if pool is initialized
-	bool IsInitialized() const { return m_bInitialized; }
+	bool IsInitialized() const { return m_bInitialized.load(std::memory_order_acquire); }
 
 private:
 	struct TWorkerThread
 	{
 		std::thread thread;
 		std::unique_ptr<SPSCQueue<TTask>> pTaskQueue;
-		std::atomic<bool> bBusy;
+		std::mutex queueMutex; // Mutex to protect SPSC queue from multiple producers
 		std::atomic<uint32_t> uTaskCount;
 
 		TWorkerThread()
-			: bBusy(false)
-			, uTaskCount(0)
+			: uTaskCount(0)
 		{
 		}
 	};
 
-	void WorkerThreadProc(int iWorkerIndex);
+	void WorkerThreadProc(TWorkerThread* pWorker);
 	int SelectLeastBusyWorker() const;
 
 	std::vector<std::unique_ptr<TWorkerThread>> m_workers;
 	std::atomic<bool> m_bShutdown;
 	std::atomic<bool> m_bInitialized;
-	std::atomic<int> m_iNextWorkerIndex; // For round-robin distribution
+	mutable std::mutex m_lifecycleMutex; // Protects initialization/destruction
 
 	static const size_t QUEUE_SIZE = 8192;
 };
@@ -67,9 +67,14 @@ private:
 template<typename TFunc>
 std::future<void> CGameThreadPool::Enqueue(TFunc&& func)
 {
-	if (!m_bInitialized)
+	// Lock to ensure thread pool isn't being destroyed
+	std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+	
+	if (!m_bInitialized.load(std::memory_order_acquire))
 	{
 		// If not initialized, execute on calling thread
+		lock.unlock(); // No need to hold lock
+		
 		auto promise = std::make_shared<std::promise<void>>();
 		auto future = promise->get_future();
 		try
@@ -109,10 +114,24 @@ std::future<void> CGameThreadPool::Enqueue(TFunc&& func)
 	int iWorkerIndex = SelectLeastBusyWorker();
 	TWorkerThread* pWorker = m_workers[iWorkerIndex].get();
 
-	// Try to enqueue the task
-	if (!pWorker->pTaskQueue->Push(std::move(task)))
+	// Increment task count before pushing
+	pWorker->uTaskCount.fetch_add(1, std::memory_order_relaxed);
+	
+	// Try to enqueue the task with mutex protection for SPSC queue
+	bool bPushed = false;
 	{
-		// Queue is full, execute on calling thread as fallback
+		std::lock_guard<std::mutex> queueLock(pWorker->queueMutex);
+		bPushed = pWorker->pTaskQueue->Push(std::move(task));
+	}
+	
+	if (!bPushed)
+	{
+		// Queue is full, decrement count and execute on calling thread as fallback
+		pWorker->uTaskCount.fetch_sub(1, std::memory_order_relaxed);
+		
+		// Release lifecycle lock before executing task
+		lock.unlock();
+		
 		try
 		{
 			(*pFunc)();
@@ -122,10 +141,6 @@ std::future<void> CGameThreadPool::Enqueue(TFunc&& func)
 		{
 			promise->set_exception(std::current_exception());
 		}
-	}
-	else
-	{
-		pWorker->uTaskCount.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	return future;

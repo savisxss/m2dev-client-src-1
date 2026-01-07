@@ -4,7 +4,6 @@
 CGameThreadPool::CGameThreadPool()
 	: m_bShutdown(false)
 	, m_bInitialized(false)
-	, m_iNextWorkerIndex(0)
 {
 }
 
@@ -15,7 +14,9 @@ CGameThreadPool::~CGameThreadPool()
 
 void CGameThreadPool::Initialize(int iWorkerCount)
 {
-	if (m_bInitialized)
+	std::lock_guard<std::mutex> lock(m_lifecycleMutex);
+	
+	if (m_bInitialized.load(std::memory_order_acquire))
 	{
 		TraceError("CGameThreadPool::Initialize - Already initialized!");
 		return;
@@ -35,30 +36,43 @@ void CGameThreadPool::Initialize(int iWorkerCount)
 	Tracef("CGameThreadPool::Initialize - Creating %d worker threads\n", iWorkerCount);
 
 	m_bShutdown.store(false, std::memory_order_release);
+	m_workers.clear();
 	m_workers.reserve(iWorkerCount);
 
-	// Initialize each worker
+	// First create all workers
 	for (int i = 0; i < iWorkerCount; ++i)
 	{
-		std::unique_ptr<TWorkerThread> pWorker(new TWorkerThread());
-		pWorker->pTaskQueue.reset(new SPSCQueue<TTask>(QUEUE_SIZE));
-		pWorker->bBusy.store(false, std::memory_order_relaxed);
+		auto pWorker = std::make_unique<TWorkerThread>();
+		pWorker->pTaskQueue = std::make_unique<SPSCQueue<TTask>>(QUEUE_SIZE);
 		pWorker->uTaskCount.store(0, std::memory_order_relaxed);
-		pWorker->thread = std::thread(&CGameThreadPool::WorkerThreadProc, this, i);
 		m_workers.push_back(std::move(pWorker));
 	}
 
+	// Mark as initialized before starting threads
 	m_bInitialized.store(true, std::memory_order_release);
+
+	// Then start threads after all workers are created
+	for (int i = 0; i < iWorkerCount; ++i)
+	{
+		TWorkerThread* pWorker = m_workers[i].get();
+		// Pass worker pointer directly instead of index
+		pWorker->thread = std::thread(&CGameThreadPool::WorkerThreadProc, this, pWorker);
+	}
 }
 
 void CGameThreadPool::Destroy()
 {
-	if (!m_bInitialized)
+	std::lock_guard<std::mutex> lock(m_lifecycleMutex);
+	
+	if (!m_bInitialized.load(std::memory_order_acquire))
 		return;
 
 	Tracef("CGameThreadPool::Destroy - Shutting down %d worker threads\n", GetWorkerCount());
 
+	// Signal shutdown first
 	m_bShutdown.store(true, std::memory_order_release);
+	
+	// Mark as not initialized to prevent new enqueues
 	m_bInitialized.store(false, std::memory_order_release);
 
 	// Join all worker threads
@@ -71,17 +85,23 @@ void CGameThreadPool::Destroy()
 	m_workers.clear();
 }
 
-void CGameThreadPool::WorkerThreadProc(int iWorkerIndex)
+void CGameThreadPool::WorkerThreadProc(TWorkerThread* pWorker)
 {
-	TWorkerThread* pWorker = m_workers[iWorkerIndex].get();
 	int iIdleCount = 0;
 
 	while (!m_bShutdown.load(std::memory_order_acquire))
 	{
 		TTask task;
-		if (pWorker->pTaskQueue->Pop(task))
+		
+		// Pop from queue with minimal locking
+		bool bHasTask = false;
 		{
-			pWorker->bBusy.store(true, std::memory_order_relaxed);
+			std::lock_guard<std::mutex> lock(pWorker->queueMutex);
+			bHasTask = pWorker->pTaskQueue->Pop(task);
+		}
+		
+		if (bHasTask)
+		{
 			iIdleCount = 0;
 
 			// Execute the task
@@ -91,15 +111,14 @@ void CGameThreadPool::WorkerThreadProc(int iWorkerIndex)
 			}
 			catch (const std::exception& e)
 			{
-				TraceError("CGameThreadPool::WorkerThreadProc - Exception in worker %d: %s", iWorkerIndex, e.what());
+				TraceError("CGameThreadPool::WorkerThreadProc - Exception: %s", e.what());
 			}
 			catch (...)
 			{
-				TraceError("CGameThreadPool::WorkerThreadProc - Unknown exception in worker %d", iWorkerIndex);
+				TraceError("CGameThreadPool::WorkerThreadProc - Unknown exception");
 			}
 
 			pWorker->uTaskCount.fetch_sub(1, std::memory_order_relaxed);
-			pWorker->bBusy.store(false, std::memory_order_relaxed);
 		}
 		else
 		{
@@ -120,8 +139,40 @@ void CGameThreadPool::WorkerThreadProc(int iWorkerIndex)
 			{
 				// Longer sleep for extended idle
 				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				// Reset idle count to prevent overflow
+				if (iIdleCount > 10000)
+					iIdleCount = 1000;
 			}
 		}
+	}
+
+	// Process remaining tasks before shutdown
+	TTask task;
+	while (true)
+	{
+		bool bHasTask = false;
+		{
+			std::lock_guard<std::mutex> lock(pWorker->queueMutex);
+			bHasTask = pWorker->pTaskQueue->Pop(task);
+		}
+		
+		if (!bHasTask)
+			break;
+			
+		try
+		{
+			task();
+		}
+		catch (const std::exception& e)
+		{
+			TraceError("CGameThreadPool::WorkerThreadProc - Exception during shutdown: %s", e.what());
+		}
+		catch (...)
+		{
+			TraceError("CGameThreadPool::WorkerThreadProc - Unknown exception during shutdown");
+		}
+		
+		pWorker->uTaskCount.fetch_sub(1, std::memory_order_relaxed);
 	}
 }
 
